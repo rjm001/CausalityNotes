@@ -1,0 +1,280 @@
+---
+title: "Propensity Score Exploration"
+author: "Ryan Martin"
+date: "3/16/2021"
+output: html_document
+---
+This exploration is based on work posted here: https://sejdemyr.github.io/r-tutorials/statistics/tutorial8.html. If you would like a copy of the raw data, please follow the instructions at the previous link. The data comes with a distribution license that prevents me from sharing it directly but it is straightforward to get yourself.
+
+The tutorial analyzes the effect of going to Catholic school (rather than public school) on student achievement. We will use propensity score matching to get more credible causal estimates of Catholic schooling. The treated group will be those who went to catholic school. The untreated are those who go to public school. The steps are as follows:
+1. Estimate the propensity score
+2. Examine the region of common support
+3. Choose and execute a matching algorim. In this tutorial, we'll use nearest neighbor propensity score matching
+4. Examine covariate balance *after* matching
+5. Estimate treatment effects.
+
+```{r}
+library(pacman)
+p_load(tidyverse, haven, MatchIt, ggplot2)
+p_load(Hmisc, pastecs, psych, skimr, magick, summarytools)
+setwd("/home/ryan/GitHubProj/Causality/ECLSPropensity")
+ecls = read_csv("data-processed/ecls.csv")
+
+
+# for this data set, treatment is catholic school, outcome is c5r2mtsch_std
+# which is a measure of the standardized math score
+```
+
+Below are some explorations of the data I performed. The output is verbose, so I am leaving this code chunk out of the final HTML file that knitr stitches together.
+
+```{r exploredata, eval=FALSE}
+# Consider summarizing tools from 5 sources
+## 1 describe from Hmisc
+## 2 stat.desc from pastecs
+## 3 describe from psych
+## 4 skim from skimr
+## 5 descr and dfSummary from summarytools
+## looks like 4 and 5 are actually the best
+
+p_load(Hmisc, pastecs, psych, skimr, magick, summarytools)
+# magick required some work; add ubuntu repository
+Hmisc::describe(ecls)
+pastecs::stat.desc(ecls)
+psych::describe(ecls)
+ecls %>% psych::describeBy(group = "catholic")
+ecls %>% psych::describeBy(group="w3income")
+skimr::skim(ecls)
+ecls %>% group_by(catholic) %>% skim # worked well!
+summarytools::descr(ecls)
+summarytools::dfSummary(ecls,round.digits = 3) #default is 1, which is misleading for binary vars
+
+## I would say I like skim and dfSummary the best!
+## dfSummary actually prints the names, which is really nice, skim doesn't
+
+## summary tools has a few other features worth looking at
+# 1 frequency tools for factor variables
+summarytools::freq(ecls$catholic)
+summarytools::freq(ecls$race)
+# 2 cross-tabulation tables
+print(summarytools::ctable(y=as.character(ecls$catholic), x=ecls$race, prop="r"), method="render")
+
+# chi-square, Odds Ratio and Risk Ratio
+p_load(magrittr)
+ctable(as.character(ecls$catholic), ecls$race, chisq=TRUE, OR=TRUE, RR=TRUE) %>% print(method="render")
+# chisquare test says there is clearly some dependence between race and religion.
+stby(data = ecls, INDICES = ecls$catholic, FUN=descr, stats = "common", transpose=TRUE)
+```
+
+Recall that a t-test tests the difference in means across two categorical variables, whereas a chi-square test tests if there is "association" between variables. Chi-square tests are for cross-tabs of categorical variables whereas t-tests are for outcome variables conditional on two categories. When there are more categories, it's ANOVA. i.e. ANOVA can test several means at the same time. 
+
+The ANOVA test for your regression model is the F-test. Can compare nested models with it. The default is nested against a constant. Thus, F-test relative to constant says if your model is "garbage" or not in the words of Hahn.
+
+In contrast, t-test can be many cases. One-sample: is your mean equal to some guessed constant (df  = n-1). Or paired: is the difference in mean equal to 0. Or if you have two distinct samples, you look at the difference across samples with pooled variance or the difference across samples with independent variances.
+
+Chi-square tests only work for categorical variables. Chi-square test of independence is not appropriate if your categorical variables represent pre-test and post-test observatoins. Use McNemar's test instead. Essentially you compare the observed cell counts vs the expected counts (the average across all categorical cases) to see if some covariates are associated with other covariates.
+
+# Pre-analysis Before Matching
+
+1.1 Difference-in-means
+
+
+Looks like the catholic students have a much higher math score
+```{r}
+ecls %>%
+  group_by(catholic) %>%
+  summarise(n_students = n(),
+            mean_math = mean(c5r2mtsc_std),
+            std_error = sd(c5r2mtsc_std) / sqrt(n_students))
+
+
+with(ecls, t.test(c5r2mtsc_std ~ catholic))
+
+# same estimates as, though slightly different p-values
+ttestreg = lm(c5r2mtsc_std ~ as.factor(catholic)+0, data = ecls)
+summary(ttestreg)
+ttestreg2 = lm(c5r2mtsc_std ~ catholic, data = ecls)
+summary(ttestreg2)
+
+```
+
+## 1.2 Difference-in-means of pre-treatment covariates
+
+Focusing on the following covariates
+- `race_white`
+- `p5hmage` mother's age
+- `w3income` family income
+- `p5numpla` number of places teh student ahs lived for at least 4 months
+- `w3momed_hsb` is the mother's education level high-schol or below (1) or some college or more (0)
+
+
+```{r}
+
+# equivalent to regressing each of the covariates on catholic without an intercept
+ecls_cov <- c('race_white', 'p5hmage', 'w3income', 'p5numpla', 'w3momed_hsb')
+ecls %>% group_by(catholic) %>%
+  select(all_of(ecls_cov)) %>%
+  summarise_all(funs(mean(., na.rm=T)))
+ecls_short = ecls %>% select(all_of(c("catholic", "c5r2mtsc_std", ecls_cov)))
+# conclude catholics are whiter, have older mothers, have much higher income, are less likely to have moved (but that's nto statistically significant) and more educated mother.
+
+lapply(ecls_cov, function(v) {
+    t.test(ecls%>% pull(v) ~ ecls %>% pull(catholic))
+})
+
+
+# get similar qualitative story on effect, conditoinal means table, but not identical 
+reg_out = lm(data = ecls_short, catholic ~ . )
+summary(reg_out)
+
+reg_out2 = glm(data = ecls_short, catholic ~ . , family= "binomial")
+summary(reg_out2)
+
+
+# gets same result as race_white vs catholic.
+lm(data = ecls, race_white~as.factor(catholic)+0)
+```
+
+
+# 2 Propensity Score Estimation
+
+- We'll predict catholic with the other covariates
+- The summary 
+
+```{r}
+ecls <- ecls %>% mutate(w3income_1k = w3income / 1000)
+m_ps <- glm(catholic ~ race_white + w3income_1k + p5hmage + p5numpla + w3momed_hsb,
+            family = binomial(), data = ecls)
+summary(m_ps)
+ecls_short <- ecls_short %>% drop_na() %>% mutate(pr_score = m_ps$fitted.values)
+
+#alternative 
+p_load(broom)
+augment(m_ps, ecls_short %>%drop_na())
+
+prs_df <- ecls_short %>% select(pr_score, catholic)
+head(prs_df)
+
+```
+
+### 2.1 Examining the Region of Common Support
+
+We'll look at the range of overlapping propensity scores; recall that a propensity score is just the logit-predicted probability that an person attends catholic school given their covariates. If there is little overlap, this suggests that the covariates across the group are quite different. You want to compare groups with similar covariates so that you are comparing apples to apples.
+
+We can see that actually, there is a fair amount of overlap but there are way more people who attended public school than who didn't among the non-NA rows.
+
+```{r}
+ggplot(prs_df, aes(x = pr_score, group=as.factor(catholic), fill=as.factor(catholic), y =..count.. )) + geom_histogram() + geom_density(aes(color=as.factor(catholic))) + scale_color_manual(values = c("brown","black"))
+
+```
+
+
+
+# 3 Executing a Matching Algorithm
+
+
+Simple Strategy:
+*Rubin and others have argued this si sufficient to eliminate 95% of the bias due to confounding of treatment status with a covariate.*
+- restrict the sample to observations within the region of common support
+- divide the sample within the region of common support into 5 quntiles
+- within each of these 5 quintiles, estimate the meandifference in student achievement by treatment status.
+
+We'll use a more complicated one:
+- find pairs of observations that have very similar propensity scores, but that differ in their treatment status.
+
+
+```{r}
+mod_match <- matchit(catholic ~ race_white + w3income + p5hmage + p5numpla + w3momed_hsb, method = "nearest", data = ecls_short)
+dta_m <- match.data(mod_match)
+dim(dta_m)
+skim(dta_m %>% select(-subclass))
+length(unique(dta_m$subclass)) # so 1 pair for each. (does drop one if odd number?)
+nrow(dta_m)
+summary(mod_match)
+
+
+lm(catholic ~. , data = dta_m)
+
+with(dta_m, t.test(c5r2mtsc_std ~ catholic)) # t-test
+
+lm_treat1 <- lm(c5r2mtsc_std ~ catholic, data = dta_m)
+summary(lm_treat1)
+
+```
+
+# 4 Examining Covariate Balance in the Matched Sample
+
+
+- First, plot the mean of each covariate against the estimated propensity score for each treatment status. If matching is done well, the treatment and control groups will have very close means of each covariate at each value of the propensity score.
+- We'll do the plot with a LOESS smoother
+
+
+```{r}
+fn_bal <- function(dta, variable) {
+  dta$variable <- dta %>% pull(variable)
+  if (variable == 'w3income') dta$variable <- dta$variable / 10^3
+  dta$catholic <- as.factor(dta$catholic)
+  support <- c(min(dta$variable), max(dta$variable))
+  ggplot(dta, aes(x = distance, y = variable, color = catholic)) +
+    geom_point(alpha = 0.2, size = 1.3) +
+    #geom_smooth(method = "loess", se = F) +
+    #geom_line() +
+    xlab("Propensity score") +
+    ylab(variable) +
+    theme_bw() +
+    ylim(support)
+}
+
+p_load(gridExtra)
+grid.arrange(
+   fn_bal(dta_m, "w3income"),
+   fn_bal(dta_m, "p5numpla") + theme(legend.position = "none"),
+   fn_bal(dta_m, "p5hmage"),
+   fn_bal(dta_m, "w3momed_hsb") + theme(legend.position = "none"),
+   fn_bal(dta_m, "race_white"),
+   nrow = 3, widths = c(1, 0.8)
+)
+
+
+```
+
+
+### 4.2 Difference-in-means
+
+Now, all the covariates have very similar means. (What is happening behind the scenes? We are eliminating about 2/3 of our data and focusing on the subset of people with a tight match. The key is that we matched but also we trimmed out the bad matches. Then, if compare means within trimmed groups, the matching part doesn't even matter. It's just to make sure each of the ones in the group has a counterpart. But we don't have to use the fact that they are matched anymore.)
+
+Note that this treatment effect is only meaningful to the extent that public school would help anyone with any covariates the same. That is, the size of the treatment effect cannot be correlated with our covariates as well. Otherwise, it may very well be that the people on shared support are not helped at all, but the catholic school devotes an enormous amount of resources (and successfully helps) the people on the right tail of the propensity score distribution. That is, if the size of treatment is also a function of propensity score, the interpretation of the result is limited.
+
+```{r}
+
+dta_m %>% group_by(catholic) %>% select(all_of(ecls_cov)) %>%
+  summarise_all(funs(mean))
+
+lapply(ecls_cov, function(v) {
+    t.test(dta_m %>% pull(v) ~ dta_m$catholic)
+})
+
+
+
+```
+
+
+# 5 Estimating Treatment Effects
+
+```{r}
+lm_treat1 <- lm(c5r2mtsc_std ~ catholic, data = dta_m)
+summary(lm_treat1)
+
+
+lm_treat2 <- lm(c5r2mtsc_std ~ catholic + race_white + p5hmage +
+                  I(w3income / 10^3) + p5numpla + w3momed_hsb, data = dta_m)
+summary(lm_treat2)
+```
+And using propensity scores, we now see that catholic school education has reversed the results! So, the interpretation is that higher math scores are not from being catholic but for what being able to attend catholic school means about you! That is, for the children with comparable covariates at catholic and non-catholic schools, catholic school is actually associated with lower math test scores! 
+
+```{r}
+ggplot(dta_m, aes(x = pr_score, group=as.factor(catholic), fill=as.factor(catholic), y =..count.. )) + geom_histogram()
+
+#ggplot(dta_m %>% keep(is.numeric) %>% gather, aes(value)) + facet_wrap( ~ key, scales="free") + geom_histogram()
+
+```
+
